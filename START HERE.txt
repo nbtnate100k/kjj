@@ -1,0 +1,18 @@
+BIN LOOKUP — HTML + PYTHON (GitHub + Railway)
+==============================================
+
+LOCAL (no Node.js needed):
+
+  cd C:\Users\motod\Downloads\here445
+  pip install -r requirements.txt
+  python app.py
+
+  Open: http://127.0.0.1:43123
+
+GITHUB + RAILWAY:
+
+  See README.md in this folder for git push and Railway deploy steps.
+
+OLD WINDOWS LAUNCHER (needs Node.js + zip):
+
+  Double-click "Open BIN Lookup Website.bat" only if you still use the Next.js zip setup.
