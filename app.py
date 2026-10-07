@@ -12,7 +12,9 @@ from flask import Flask, Response, jsonify, request
 
 import html
 import json
+import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -239,10 +241,38 @@ def format_card_block(
 
 # --- lookup ---
 
-MAX_WORKERS = 25
-MAX_RETRIES = 4
-REQUEST_DELAY_SEC = 0.15
+MAX_WORKERS = 4
+MAX_RETRIES = 12
+REQUEST_DELAY_SEC = 0.1
+MIN_REQUEST_INTERVAL_SEC = 0.45
 FYATU_API_URL = "https://fyatu.com/api/bin-lookup?bin={bin}"
+
+_rate_lock = threading.Lock()
+_next_request_at = 0.0
+
+
+def _wait_fyatu_slot() -> None:
+    global _next_request_at
+    with _rate_lock:
+        now = time.monotonic()
+        if now < _next_request_at:
+            time.sleep(_next_request_at - now)
+        _next_request_at = time.monotonic() + MIN_REQUEST_INTERVAL_SEC
+
+
+def _is_rate_limited(result: dict[str, str]) -> bool:
+    err = str(result.get("error") or "")
+    return "Too many requests" in err or "HTTP 429" in err
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError, attempt: int) -> float:
+    raw = exc.headers.get("Retry-After") if exc.headers else None
+    if raw:
+        try:
+            return max(float(raw), 1.0)
+        except ValueError:
+            pass
+    return min(45.0, 1.5 * (2**attempt)) + random.uniform(0.0, 0.75)
 
 
 def _parse_fyatu_response(payload: dict[str, Any], bin_number: str) -> dict[str, str]:
@@ -266,6 +296,7 @@ def _parse_fyatu_response(payload: dict[str, Any], bin_number: str) -> dict[str,
 
 def fetch_bin(bin_number: str) -> dict[str, str]:
     for attempt in range(MAX_RETRIES):
+        _wait_fyatu_slot()
         request = urllib.request.Request(
             FYATU_API_URL.format(bin=bin_number),
             headers={
@@ -275,13 +306,13 @@ def fetch_bin(bin_number: str) -> dict[str, str]:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=20) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             time.sleep(REQUEST_DELAY_SEC)
             return _parse_fyatu_response(payload, bin_number)
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
-                time.sleep(1.0 * (2**attempt))
+                time.sleep(_retry_after_seconds(exc, attempt))
                 continue
             return {"error": f"Lookup failed (HTTP {exc.code})."}
         except Exception as exc:
@@ -295,17 +326,39 @@ def lookup_bins_with_progress(
 ) -> dict[str, dict[str, str]]:
     total = len(unique_bins)
     cache: dict[str, dict[str, str]] = {}
-    done = 0
-    workers = min(MAX_WORKERS, total or 1)
+    resolved = 0
+    progress_lock = threading.Lock()
 
+    def mark_resolved() -> None:
+        nonlocal resolved
+        with progress_lock:
+            resolved += 1
+            if on_progress:
+                on_progress(resolved, total)
+
+    workers = min(MAX_WORKERS, total or 1)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch_bin, b): b for b in unique_bins}
+        rate_limited: list[str] = []
         for future in as_completed(futures):
             bin_number = futures[future]
-            cache[bin_number] = future.result()
-            done += 1
-            if on_progress:
-                on_progress(done, total)
+            result = future.result()
+            cache[bin_number] = result
+            if _is_rate_limited(result):
+                rate_limited.append(bin_number)
+            else:
+                mark_resolved()
+
+    for bin_number in rate_limited:
+        time.sleep(2.0)
+        result = fetch_bin(bin_number)
+        cache[bin_number] = result
+        if _is_rate_limited(result):
+            time.sleep(4.0)
+            result = fetch_bin(bin_number)
+            cache[bin_number] = result
+        mark_resolved()
+
     return cache
 
 
