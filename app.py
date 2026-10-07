@@ -240,9 +240,23 @@ def format_card_block(
 # --- lookup ---
 
 MAX_WORKERS = 25
-MAX_RETRIES = 4
 REQUEST_DELAY_SEC = 0.15
+RATE_LIMIT_BACKOFF_CAP_SEC = 60.0
 NAMSO_API_URL = "https://namso.live/api/v1/bin.php?bin={bin}"
+
+
+def _is_rate_limit_message(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "too many request" in lowered
+        or "rate limit" in lowered
+        or "429" in lowered
+        or lowered.strip() == "lookup error"
+    )
+
+
+def _is_rate_limited_result(data: dict[str, str]) -> bool:
+    return _is_rate_limit_message(str(data.get("error", "")))
 
 
 def _parse_namso_response(payload: dict[str, Any], bin_number: str) -> dict[str, str]:
@@ -263,7 +277,8 @@ def _parse_namso_response(payload: dict[str, Any], bin_number: str) -> dict[str,
 
 
 def fetch_bin(bin_number: str) -> dict[str, str]:
-    for attempt in range(MAX_RETRIES):
+    attempt = 0
+    while True:
         request = urllib.request.Request(
             NAMSO_API_URL.format(bin=bin_number),
             headers={
@@ -275,15 +290,24 @@ def fetch_bin(bin_number: str) -> dict[str, str]:
             with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             time.sleep(REQUEST_DELAY_SEC)
-            return _parse_namso_response(payload, bin_number)
+            result = _parse_namso_response(payload, bin_number)
+            if not _is_rate_limited_result(result):
+                return result
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
-                time.sleep(1.0 * (2**attempt))
-                continue
-            return {"error": f"Lookup failed (HTTP {exc.code})."}
+                result = {"error": f"Too many requests for BIN {bin_number}."}
+            else:
+                return {"error": f"Lookup failed (HTTP {exc.code})."}
+            if not _is_rate_limited_result(result):
+                return result
         except Exception as exc:
-            return {"error": str(exc)}
-    return {"error": f"Too many requests for BIN {bin_number} — try again."}
+            result = {"error": str(exc)}
+            if not _is_rate_limited_result(result):
+                return result
+
+        wait = min(RATE_LIMIT_BACKOFF_CAP_SEC, 1.0 * (2 ** min(attempt, 8)))
+        time.sleep(wait)
+        attempt += 1
 
 
 def lookup_bins_with_progress(
