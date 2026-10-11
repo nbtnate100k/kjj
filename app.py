@@ -48,6 +48,79 @@ EMPTY_CONTACT: dict[str, str] = {
     "email": "",
 }
 
+US_STATE_CODES = frozenset(
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT "
+    "NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split()
+)
+COUNTRY_CODES = frozenset(
+    "US CA GB UK AU DE FR IT ES NL BE SE NO DK FI IE AT CH PT PL CZ HU RO GR TR MX BR "
+    "IN JP CN KR SG AE SA NZ ZA".split()
+)
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", re.I)
+ZIP_RE = re.compile(r"^\d{5}(-\d{4})?$")
+ISSUER_HINTS = (
+    "MASTERCARD",
+    "VISA",
+    "AMEX",
+    "AMERICAN EXPRESS",
+    "DISCOVER",
+    "CREDIT",
+    "DEBIT",
+    "PREPAID",
+    " BANK",
+    "BANK ",
+    "WORLD ELITE",
+    "CLASSIC",
+    "GOLD ",
+    " PLATINUM",
+)
+
+
+def _phone_digit_count(value: str) -> int:
+    return len(re.sub(r"\D", "", value))
+
+
+def looks_like_email(value: str) -> bool:
+    return bool(value and EMAIL_RE.match(value.strip()))
+
+
+def looks_like_phone(value: str) -> bool:
+    if not value or looks_like_email(value):
+        return False
+    stripped = value.strip()
+    if looks_like_issuer_summary(stripped):
+        return False
+    digits = _phone_digit_count(stripped)
+    return 10 <= digits <= 15 and re.search(r"\d{3}", stripped)
+
+
+def looks_like_zip(value: str) -> bool:
+    return bool(value and ZIP_RE.match(value.strip()))
+
+
+def looks_like_state(value: str) -> bool:
+    token = (value or "").strip().upper()
+    return len(token) == 2 and token in US_STATE_CODES
+
+
+def looks_like_country(value: str) -> bool:
+    token = (value or "").strip().upper()
+    if token == "UK":
+        token = "GB"
+    return len(token) == 2 and token in COUNTRY_CODES and token not in US_STATE_CODES
+
+
+def looks_like_issuer_summary(value: str) -> bool:
+    text = (value or "").strip()
+    if not text or looks_like_email(text):
+        return False
+    if "—" in text or " – " in text:
+        upper = text.upper()
+        return any(hint in upper for hint in ISSUER_HINTS)
+    upper = text.upper()
+    hits = sum(1 for hint in ISSUER_HINTS if hint in upper)
+    return hits >= 2 and "@" not in text
+
 
 @dataclass
 class CardEntry:
@@ -126,28 +199,70 @@ def card_match_from_line(line: str) -> tuple[str | None, str]:
 
 
 def contact_from_parts(parts: list[str], start: int) -> dict[str, str]:
-    def at(offset: int) -> str:
-        idx = start + offset
-        return parts[idx] if idx < len(parts) else ""
+    tail = [p.strip() for p in parts[start:] if p.strip()]
+    contact = dict(EMPTY_CONTACT)
+    if not tail:
+        return contact
 
-    phone_offset = 5
-    if (
-        at(5)
-        and re.fullmatch(r"[A-Za-z]{2}", at(5))
-        and at(6)
-        and re.search(r"\d", at(6))
-    ):
-        phone_offset = 6
+    used: set[int] = set()
+    skipped: set[int] = set()
 
-    return {
-        "name": at(0),
-        "address": at(1),
-        "city": at(2),
-        "state": at(3),
-        "zip": at(4),
-        "phone": at(phone_offset),
-        "email": at(phone_offset + 1),
-    }
+    for i, value in enumerate(tail):
+        if looks_like_issuer_summary(value):
+            skipped.add(i)
+
+    for i, value in enumerate(tail):
+        if i in used or i in skipped:
+            continue
+        if looks_like_email(value):
+            contact["email"] = value
+            used.add(i)
+
+    for i, value in enumerate(tail):
+        if i in used or i in skipped:
+            continue
+        if looks_like_phone(value):
+            contact["phone"] = value
+            used.add(i)
+
+    for i, value in enumerate(tail):
+        if i in used or i in skipped:
+            continue
+        if looks_like_zip(value):
+            contact["zip"] = value
+            used.add(i)
+
+    for i, value in enumerate(tail):
+        if i in used or i in skipped:
+            continue
+        if looks_like_state(value):
+            contact["state"] = value.upper()
+            used.add(i)
+
+    for i, value in enumerate(tail):
+        if i in used or i in skipped:
+            continue
+        if looks_like_country(value):
+            skipped.add(i)
+
+    remaining = [tail[i] for i in range(len(tail)) if i not in used and i not in skipped]
+    for key in ("name", "address", "city"):
+        if remaining:
+            contact[key] = remaining.pop(0)
+
+    for value in remaining:
+        if looks_like_issuer_summary(value):
+            continue
+        if not contact["phone"] and looks_like_phone(value):
+            contact["phone"] = value
+        elif not contact["email"] and looks_like_email(value):
+            contact["email"] = value
+        elif not contact["zip"] and looks_like_zip(value):
+            contact["zip"] = value
+        elif not contact["state"] and looks_like_state(value):
+            contact["state"] = value.upper()
+
+    return contact
 
 
 def parse_line_entry(line: str) -> CardEntry | None:
